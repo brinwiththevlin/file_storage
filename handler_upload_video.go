@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
@@ -80,12 +84,23 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	localVideo.Seek(0, io.SeekStart)
 
+	ratio, err := getVideoAspectRatio(localVideo.Name())
+	var prefix string
+	switch ratio {
+	case "16:9":
+		prefix = "landscape/"
+	case "9:16":
+		prefix = "portrait/"
+	default:
+		prefix = "other/"
+	}
+
 	bytes := make([]byte, 32)
 	_, err = rand.Read(bytes)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "could not generate temproary video name", err)
 	}
-	videoName := hex.EncodeToString(bytes) + ".mp4"
+	videoName := prefix + hex.EncodeToString(bytes) + ".mp4"
 	_, err = cfg.s3Client.PutObject(context.Background(), &s3.PutObjectInput{Bucket: &cfg.s3Bucket, Key: &videoName, Body: localVideo, ContentType: &contentType})
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "could not upload video", err)
@@ -97,4 +112,48 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	cfg.db.UpdateVideo(videoMeta)
 
 	respondWithJSON(w, http.StatusOK, struct{}{})
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	type Stream struct {
+		Width  int `json:"width"`
+		Height int `json:"height"`
+	}
+
+	type VideoMeta struct {
+		Streams []Stream `json:"streams"`
+	}
+
+	cmd := exec.Command("ffprobe",
+		"-v", "error",
+		"-print_format", "json",
+		"-show_streams", filePath,
+	)
+	var b bytes.Buffer
+	cmd.Stdout = &b
+
+	err := cmd.Run()
+	if err != nil {
+		log.Println("ffprobe failed", err)
+		return "", err
+	}
+
+	meta := VideoMeta{}
+	err = json.Unmarshal(b.Bytes(), &meta)
+	if err != nil {
+		log.Println(err)
+		return "", err
+	}
+
+	const sixteenNine float64 = 16.0 / 9.0
+	ratio := float64(meta.Streams[0].Width) / float64(meta.Streams[0].Height)
+
+	tolerance := 0.4
+	if ratio < sixteenNine+tolerance && ratio > sixteenNine-tolerance {
+		return "16:9", nil
+	}
+	if ratio < 1/sixteenNine+tolerance && ratio > 1/sixteenNine-tolerance {
+		return "9:16", nil
+	}
+	return "other", nil
 }
